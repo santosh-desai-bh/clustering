@@ -1,7 +1,7 @@
 # Core dependencies
 streamlit==1.29.0
-pandas==2.1.4
-numpy==1.26.2
+pandas==2.2.0  # Updated for Python 3.13 compatibility
+numpy==1.26.4  # Updated for better compatibility
 
 # Visualization
 plotly==5.18.0
@@ -9,14 +9,14 @@ folium==0.15.1
 streamlit-folium==0.17.4
 
 # Machine Learning
-scikit-learn==1.3.2
-scipy==1.11.4
+scikit-learn==1.4.0  # Updated for Python 3.13 compatibility
+scipy==1.12.0  # Updated for Python 3.13 compatibility
 
 # Geospatial
 geopy==2.4.1
 
 # Optional but recommended for better performance
-numba==0.58.1
+numba==0.59.0  # Updated for Python 3.13 compatibility
 haversine==2.8.0
 
 # For better map visualizations (optional)
