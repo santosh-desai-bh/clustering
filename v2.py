@@ -24,6 +24,10 @@ st.set_page_config(
     layout="wide"
 )
 
+# Initialize session state
+if 'clusters' not in st.session_state:
+    st.session_state.clusters = None
+
 # Custom CSS for better visuals
 st.markdown("""
 <style>
@@ -97,6 +101,46 @@ enable_multi_trip = st.sidebar.checkbox("Enable Multi-Trip Optimization", value=
 if enable_multi_trip:
     multi_trip_percent = st.sidebar.slider("% Drivers for Multi-Trip", 20, 50, 30)
     trips_per_driver = st.sidebar.slider("Max Trips per Driver", 2, 4, 3)
+
+# Helper function for convex hull (if scipy not available)
+def ConvexHull(points):
+    """Simple convex hull implementation"""
+    from collections import namedtuple
+    Point = namedtuple('Point', ['x', 'y'])
+    
+    def cross(O, A, B):
+        return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x)
+    
+    points = [Point(p[1], p[0]) for p in points]
+    points = sorted(set(points))
+    if len(points) <= 1:
+        return type('obj', (object,), {'vertices': list(range(len(points)))})
+    
+    # Build lower hull
+    lower = []
+    for p in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    
+    # Build upper hull
+    upper = []
+    for p in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    
+    hull_points = lower[:-1] + upper[:-1]
+    
+    # Find indices
+    vertices = []
+    for hp in hull_points:
+        for i, p in enumerate(points):
+            if p.x == hp.x and p.y == hp.y:
+                vertices.append(i)
+                break
+    
+    return type('obj', (object,), {'vertices': vertices})
 
 # Main content
 if order_file is not None:
@@ -288,6 +332,9 @@ if order_file is not None:
     with tab3:
         st.header("💰 Cost-Benefit Analysis")
         
+        # Default cost value
+        total_cost = len(df_orders) * 900  # Default assumption
+        
         # Load cost data if available
         if cost_file is not None:
             df_costs = pd.read_csv(cost_file)
@@ -299,7 +346,8 @@ if order_file is not None:
             
             with col1:
                 st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                total_cost = df_costs['cost'].sum() if 'cost' in df_costs.columns else len(df_orders) * 900
+                if 'cost' in df_costs.columns:
+                    total_cost = df_costs['cost'].sum()
                 avg_cost_per_order = total_cost / len(df_orders)
                 st.metric("Total Cost (Period)", f"₹{total_cost:,.0f}")
                 st.metric("Average Cost per Order", f"₹{avg_cost_per_order:.2f}")
@@ -311,6 +359,10 @@ if order_file is not None:
                 st.metric("Avg Driver Earning", f"₹{avg_driver_earning:,.0f}")
                 st.metric("Cost per KM", "₹12-15 (estimated)")
                 st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            # Use default values if no cost file
+            avg_cost_per_order = total_cost / len(df_orders)
+            st.info("📊 Using estimated costs (₹900 per driver). Upload cost data for accurate analysis.")
         
         # Optimized cost projection
         st.subheader("🎯 Optimized Cost Projection")
@@ -494,6 +546,8 @@ if order_file is not None:
                     st.write(f"Can complete {trips_per_driver} trips/day")
                 else:
                     st.info("📍 Single trip route")
+        else:
+            st.warning("⚠️ Please generate clusters in the 'Cluster Visualization' tab first.")
     
     with tab5:
         st.header("📈 Performance Metrics & KPIs")
@@ -610,43 +664,3 @@ st.markdown("""
     Built with Streamlit | Optimizing Last-Mile Delivery in Bengaluru
 </div>
 """, unsafe_allow_html=True)
-
-# Helper function for convex hull (if scipy not available)
-def ConvexHull(points):
-    """Simple convex hull implementation"""
-    from collections import namedtuple
-    Point = namedtuple('Point', ['x', 'y'])
-    
-    def cross(O, A, B):
-        return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x)
-    
-    points = [Point(p[1], p[0]) for p in points]
-    points = sorted(set(points))
-    if len(points) <= 1:
-        return type('obj', (object,), {'vertices': list(range(len(points)))})
-    
-    # Build lower hull
-    lower = []
-    for p in points:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-    
-    # Build upper hull
-    upper = []
-    for p in reversed(points):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-    
-    hull_points = lower[:-1] + upper[:-1]
-    
-    # Find indices
-    vertices = []
-    for hp in hull_points:
-        for i, p in enumerate(points):
-            if p.x == hp.x and p.y == hp.y:
-                vertices.append(i)
-                break
-    
-    return type('obj', (object,), {'vertices': vertices})
