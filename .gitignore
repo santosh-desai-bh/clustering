@@ -147,6 +147,10 @@ dmypy.json
 *.db
 *.sqlite
 
+# Exception: Keep GeoJSON files for visualization
+!*.geojson
+!bengaluru.geojson
+
 # OS specific
 .DS_Store
 .DS_Store?
