@@ -896,8 +896,25 @@ def main():
             st.divider()
             st.subheader("📊 Driver Requirements Analysis")
             
+            # Get driver requirements data first before showing rationale
+            current_summary, clustered_summary = optimizer.calculate_driver_requirements()
+            
+            # Initialize variables to avoid UnboundLocalError
+            total_current_median = total_current_peak = 0
+            total_optimized_median = total_optimized_peak = 0
+            total_theoretical_median = total_theoretical_peak = 0
+            
+            if current_summary is not None and clustered_summary is not None:
+                # Calculate totals early
+                total_current_median = current_summary['drivers_used_median'].sum()
+                total_current_peak = current_summary['drivers_used_max'].sum()
+                total_optimized_median = clustered_summary['drivers_required_median'].sum()
+                total_optimized_peak = clustered_summary['drivers_required_max'].sum()
+                total_theoretical_median = current_summary['drivers_theoretical_median'].sum()
+                total_theoretical_peak = current_summary['drivers_theoretical_max'].sum()
+            
             # Show capacity rationale if available
-            if hasattr(st.session_state, 'capacity_rationale'):
+            if hasattr(st.session_state, 'capacity_rationale') and current_summary is not None:
                 rationale = st.session_state.capacity_rationale
                 
                 with st.expander("🧮 Driver Capacity Rationale - Click to Expand", expanded=False):
@@ -1134,15 +1151,22 @@ def main():
                 
                 with col2:
                     st.subheader("📈 Key Improvements")
-                    cluster_summary = optimizer.clustered_df.groupby(['cluster_id', 'assigned_warehouse']).agg({
-                        'order_id': 'count',
-                        'distance_to_center_km': 'mean'
-                    }).reset_index()
-                    
-                    st.write(f"• **{len(cluster_summary)}** optimized delivery zones")
-                    st.write(f"• **{cluster_summary['distance_to_center_km'].mean():.1f}km** average delivery distance")
-                    st.write(f"• **{int(total_current_median - total_optimized_median)}** fewer drivers on median days")
-                    st.write(f"• **{cluster_summary['order_id'].sum():,}** total orders optimized")
+                    if optimizer.clustered_df is not None:
+                        cluster_summary = optimizer.clustered_df.groupby(['cluster_id', 'assigned_warehouse']).agg({
+                            'order_id': 'count',
+                            'distance_to_center_km': 'mean'
+                        }).reset_index()
+                        
+                        st.write(f"• **{len(cluster_summary)}** optimized delivery zones")
+                        st.write(f"• **{cluster_summary['distance_to_center_km'].mean():.1f}km** average delivery distance")
+                        
+                        # Only show driver savings if variables are available
+                        if total_current_median > 0 and total_optimized_median > 0:
+                            st.write(f"• **{int(total_current_median - total_optimized_median)}** fewer drivers on median days")
+                        
+                        st.write(f"• **{cluster_summary['order_id'].sum():,}** total orders optimized")
+                    else:
+                        st.info("Cluster data not available")
             
             else:
                 st.info("Driver analysis available after creating clusters")
