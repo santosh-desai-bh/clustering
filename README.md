@@ -16,19 +16,33 @@ The CSV file should contain delivery records with coordinates, hub assignments, 
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.8+
-- pip package manager
+- **Python 3.8+** (tested on Python 3.11)
+- **pip** package manager
+- **Git** (for cloning repository)
+- **8GB+ RAM** recommended for large datasets
 
 ### Installation
 
 1. **Clone or download this repository**
 ```bash
-cd /Users/blowhorn/clustering
+git clone <repository-url>
+cd clustering
 ```
 
-2. **Install dependencies**
+2. **Create virtual environment (recommended)**
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. **Install dependencies**
 ```bash
 pip install -r requirements.txt
+```
+
+4. **Verify installation**
+```bash
+python test_installation.py
 ```
 
 3. **Download data**

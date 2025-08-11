@@ -1,19 +1,24 @@
-# Core dependencies
-streamlit==1.29.0
-pandas==2.2.0
-numpy==1.26.4
+# Core web framework
+streamlit>=1.28.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
 
 # Visualization
-plotly==5.18.0
+plotly>=5.15.0
 
 # Machine Learning
-scikit-learn==1.4.0
-scipy==1.12.0
+scikit-learn>=1.3.0
+scipy>=1.10.0
 
-# Geospatial
-geopandas==0.14.0
-shapely==2.0.1
-requests==2.31.0
+# Geospatial processing
+geopandas>=0.13.0
+shapely>=2.0.0
 
-# Date handling
-python-dateutil==2.8.2
+# HTTP requests
+requests>=2.30.0
+
+# Standard library modules (included with Python)
+# json - built-in
+# math - built-in
