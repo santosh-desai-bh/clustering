@@ -17,6 +17,7 @@ import math
 import requests
 import geopandas as gpd
 from shapely.geometry import Point
+from itertools import permutations
 
 # Page configuration
 st.set_page_config(
@@ -221,6 +222,391 @@ class DeliveryOptimizer:
         distance = R * c
         
         return distance
+    
+    def _get_direction_from_warehouse(self, warehouse_coords, order_lat, order_lng):
+        """Classify order direction from warehouse as NE, NW, SE, SW, or CENTRAL"""
+        lat_diff = order_lat - warehouse_coords['lat']
+        lng_diff = order_lng - warehouse_coords['lng']
+        
+        # Calculate distance to determine if it's central
+        distance = self._haversine_distance(warehouse_coords['lat'], warehouse_coords['lng'], order_lat, order_lng)
+        
+        # If very close to warehouse (< 2km), consider it central
+        if distance < 2.0:
+            return 'CENTRAL'
+        
+        # Determine direction based on lat/lng differences
+        if lat_diff >= 0 and lng_diff >= 0:
+            return 'NE'  # North-East
+        elif lat_diff >= 0 and lng_diff < 0:
+            return 'NW'  # North-West  
+        elif lat_diff < 0 and lng_diff >= 0:
+            return 'SE'  # South-East
+        else:
+            return 'SW'  # South-West
+    
+    def _group_orders_by_direction(self, cluster_data, warehouse_coords):
+        """Group orders by geographic direction from warehouse"""
+        direction_groups = {'NE': [], 'NW': [], 'SE': [], 'SW': [], 'CENTRAL': []}
+        
+        for idx, order in cluster_data.iterrows():
+            direction = self._get_direction_from_warehouse(
+                warehouse_coords, 
+                order['delivery_lat'], 
+                order['delivery_lng']
+            )
+            direction_groups[direction].append(order)
+        
+        # Convert lists to DataFrames
+        for direction in direction_groups:
+            if direction_groups[direction]:
+                direction_groups[direction] = pd.DataFrame(direction_groups[direction])
+            else:
+                direction_groups[direction] = pd.DataFrame()
+        
+        return direction_groups
+    
+    def optimize_cluster_routes(self, max_distance_per_route=40, max_time_hours=4):
+        """Optimize delivery routes within each cluster with realistic driver constraints
+        
+        Args:
+            max_distance_per_route: Maximum distance per route in km (default: 40km)
+            max_time_hours: Maximum time per route in hours (default: 4 hours)
+        
+        Driver batching logic:
+        - Each driver gets one route starting and ending at warehouse
+        - Route optimized for minimum distance using nearest neighbor
+        - Constraints: 40km max distance, 4 hours max time
+        - Time = travel_time + delivery_time (5 min per delivery)
+        """
+        if self.clustered_df is None:
+            return None
+            
+        cluster_routes = {}
+        delivery_time_per_order = 5  # 5 minutes per delivery
+        avg_speed_kmh = 25  # Average speed in city traffic
+        
+        for cluster_id in self.clustered_df['cluster_id'].unique():
+            cluster_data = self.clustered_df[self.clustered_df['cluster_id'] == cluster_id].copy()
+            warehouse = cluster_data['assigned_warehouse'].iloc[0]
+            warehouse_coords = self.warehouses[warehouse]
+            
+            # Create driver routes with realistic constraints
+            routes = self._create_driver_batches(
+                cluster_data, 
+                warehouse_coords, 
+                max_distance_per_route, 
+                max_time_hours, 
+                delivery_time_per_order,
+                avg_speed_kmh
+            )
+            
+            cluster_routes[cluster_id] = {
+                'warehouse': warehouse,
+                'warehouse_coords': warehouse_coords,
+                'routes': [],
+                'drivers_needed': len(routes)
+            }
+            
+            for i, route_orders in enumerate(routes):
+                optimized_route = self._optimize_single_route(route_orders, warehouse_coords)
+                route_distance = self._calculate_route_distance(optimized_route, warehouse_coords)
+                route_time = (route_distance / avg_speed_kmh) + (len(optimized_route) * delivery_time_per_order / 60)
+                
+                cluster_routes[cluster_id]['routes'].append({
+                    'route_id': f"R{cluster_id}-{i+1}",
+                    'driver_id': f"Driver-{cluster_id}-{i+1}",
+                    'orders': optimized_route,
+                    'total_distance': route_distance,
+                    'total_time_hours': route_time,
+                    'order_count': len(optimized_route),
+                    'efficiency_score': len(optimized_route) / route_distance if route_distance > 0 else 0
+                })
+        
+        return cluster_routes
+    
+    def _create_driver_batches(self, cluster_data, warehouse_coords, max_distance, max_time_hours, delivery_time_per_order, avg_speed):
+        """Create driver batches with realistic constraints, balanced loads, and directional routing"""
+        total_orders = len(cluster_data)
+        if total_orders == 0:
+            return []
+        
+        # Calculate cluster density and spread to determine routing strategy
+        cluster_center_lat = cluster_data['delivery_lat'].mean()
+        cluster_center_lng = cluster_data['delivery_lng'].mean()
+        
+        # Calculate max distance from center of cluster
+        max_distance_from_center = 0
+        for idx, order in cluster_data.iterrows():
+            dist = self._haversine_distance(cluster_center_lat, cluster_center_lng, 
+                                          order['delivery_lat'], order['delivery_lng'])
+            max_distance_from_center = max(max_distance_from_center, dist)
+        
+        # Determine if cluster is small and dense (< 5km radius) or large and spread
+        is_small_dense_cluster = max_distance_from_center < 5.0
+        
+        # Calculate optimal number of drivers for balanced loads
+        min_orders_per_driver = 22
+        max_orders_per_driver = 32  # 30 + 2 buffer
+        optimal_drivers = max(1, round(total_orders / 28))  # Target ~28 orders per driver to minimize drivers
+        
+        # Adjust if loads would be too unbalanced or insufficient
+        avg_orders_per_driver = total_orders / optimal_drivers
+        if avg_orders_per_driver < min_orders_per_driver:
+            optimal_drivers = max(1, total_orders // min_orders_per_driver)
+        elif avg_orders_per_driver > max_orders_per_driver:
+            optimal_drivers = max(1, (total_orders + max_orders_per_driver - 1) // max_orders_per_driver)  # Ceiling division
+        
+        # Calculate target orders per driver for balanced distribution
+        base_orders_per_driver = total_orders // optimal_drivers
+        extra_orders = total_orders % optimal_drivers
+        
+        # Create target sizes for each driver
+        target_sizes = []
+        for i in range(optimal_drivers):
+            target_size = base_orders_per_driver + (1 if i < extra_orders else 0)
+            target_sizes.append(target_size)
+        
+        routes = []
+        
+        if is_small_dense_cluster:
+            # For small dense clusters: use simple balanced batching (all directions mixed)
+            routes = self._create_balanced_routes_simple(
+                cluster_data, warehouse_coords, target_sizes, 
+                max_distance, max_time_hours, delivery_time_per_order, avg_speed, max_orders_per_driver
+            )
+        else:
+            # For large spread clusters: use directional routing for minimum travel
+            routes = self._create_directional_routes(
+                cluster_data, warehouse_coords, target_sizes,
+                max_distance, max_time_hours, delivery_time_per_order, avg_speed, max_orders_per_driver
+            )
+        
+        return routes
+    
+    def _create_balanced_routes_simple(self, cluster_data, warehouse_coords, target_sizes, 
+                                     max_distance, max_time_hours, delivery_time_per_order, avg_speed, max_orders_per_driver):
+        """Create balanced routes for small dense clusters - optimize for maximum deliveries per route"""
+        routes = []
+        remaining_orders = cluster_data.copy()
+        
+        for driver_idx, target_size in enumerate(target_sizes):
+            if len(remaining_orders) == 0:
+                break
+                
+            # Start new route from warehouse - optimize for maximum deliveries with minimum travel
+            current_route = []
+            
+            # Find the most central starting point to minimize overall travel
+            if len(remaining_orders) > 0:
+                center_lat = remaining_orders['delivery_lat'].mean()
+                center_lng = remaining_orders['delivery_lng'].mean()
+                
+                # Find order closest to center as starting point
+                center_distances = remaining_orders.apply(
+                    lambda row: self._haversine_distance(center_lat, center_lng, row['delivery_lat'], row['delivery_lng']), axis=1
+                )
+                start_idx = center_distances.idxmin()
+                start_order = remaining_orders.loc[start_idx]
+                current_route.append(start_order)
+                current_lat, current_lng = start_order['delivery_lat'], start_order['delivery_lng']
+                remaining_orders = remaining_orders.drop(start_idx)
+            
+            # Build route using nearest neighbor but prioritize maximizing deliveries
+            while len(current_route) < target_size and len(remaining_orders) > 0:
+                # Find nearest unvisited order
+                distances = remaining_orders.apply(
+                    lambda row: self._haversine_distance(current_lat, current_lng, row['delivery_lat'], row['delivery_lng']), axis=1
+                )
+                
+                # Try multiple nearest orders to find best fit for constraints
+                sorted_distances = distances.sort_values()
+                added_order = False
+                
+                for candidate_idx in sorted_distances.head(min(3, len(sorted_distances))).index:
+                    candidate_order = remaining_orders.loc[candidate_idx]
+                    potential_route = current_route + [candidate_order]
+                    
+                    potential_distance = self._calculate_route_distance(
+                        [order.to_dict() if hasattr(order, 'to_dict') else order for order in potential_route], 
+                        warehouse_coords
+                    )
+                    potential_time = (potential_distance / avg_speed) + (len(potential_route) * delivery_time_per_order / 60)
+                    
+                    # Check if we can add this order
+                    if (potential_distance <= max_distance and 
+                        potential_time <= max_time_hours and 
+                        len(potential_route) <= max_orders_per_driver):
+                        
+                        current_route.append(candidate_order)
+                        current_lat, current_lng = candidate_order['delivery_lat'], candidate_order['delivery_lng']
+                        remaining_orders = remaining_orders.drop(candidate_idx)
+                        added_order = True
+                        break
+                
+                if not added_order:
+                    break  # No more orders can be added to this route
+            
+            # Add completed route
+            if current_route:
+                routes.append(pd.DataFrame(current_route))
+        
+        # Distribute any remaining orders
+        self._distribute_remaining_orders(routes, remaining_orders, max_orders_per_driver)
+        return routes
+    
+    def _create_directional_routes(self, cluster_data, warehouse_coords, target_sizes,
+                                 max_distance, max_time_hours, delivery_time_per_order, avg_speed, max_orders_per_driver):
+        """Create directional routes for large spread clusters - minimize travel by grouping by direction"""
+        # Group orders by direction
+        direction_groups = self._group_orders_by_direction(cluster_data, warehouse_coords)
+        
+        routes = []
+        all_remaining = cluster_data.copy()
+        
+        # Priority order for directions (can be customized)
+        direction_priority = ['CENTRAL', 'NE', 'NW', 'SE', 'SW']
+        
+        for target_size in target_sizes:
+            if len(all_remaining) == 0:
+                break
+                
+            current_route = []
+            
+            # Try to fill route primarily from one direction for efficient travel
+            for direction in direction_priority:
+                if len(current_route) >= target_size:
+                    break
+                    
+                direction_orders = all_remaining[all_remaining.apply(
+                    lambda row: self._get_direction_from_warehouse(warehouse_coords, row['delivery_lat'], row['delivery_lng']) == direction, axis=1
+                )]
+                
+                if len(direction_orders) == 0:
+                    continue
+                
+                # Add orders from this direction efficiently
+                remaining_in_direction = direction_orders.copy()
+                current_lat, current_lng = warehouse_coords['lat'], warehouse_coords['lng']
+                
+                while len(current_route) < target_size and len(remaining_in_direction) > 0:
+                    # Find nearest order in this direction
+                    distances = remaining_in_direction.apply(
+                        lambda row: self._haversine_distance(current_lat, current_lng, row['delivery_lat'], row['delivery_lng']), axis=1
+                    )
+                    
+                    nearest_idx = distances.idxmin()
+                    nearest_order = remaining_in_direction.loc[nearest_idx]
+                    
+                    # Check constraints
+                    potential_route = current_route + [nearest_order]
+                    potential_distance = self._calculate_route_distance(
+                        [order.to_dict() if hasattr(order, 'to_dict') else order for order in potential_route], 
+                        warehouse_coords
+                    )
+                    potential_time = (potential_distance / avg_speed) + (len(potential_route) * delivery_time_per_order / 60)
+                    
+                    if (potential_distance <= max_distance and 
+                        potential_time <= max_time_hours and 
+                        len(potential_route) <= max_orders_per_driver):
+                        
+                        current_route.append(nearest_order)
+                        current_lat, current_lng = nearest_order['delivery_lat'], nearest_order['delivery_lng']
+                        all_remaining = all_remaining.drop(nearest_idx)
+                        remaining_in_direction = remaining_in_direction.drop(nearest_idx)
+                    else:
+                        break  # Can't add more from this direction
+            
+            # Add completed route
+            if current_route:
+                routes.append(pd.DataFrame(current_route))
+        
+        # Distribute any remaining orders
+        self._distribute_remaining_orders(routes, all_remaining, max_orders_per_driver)
+        return routes
+    
+    def _distribute_remaining_orders(self, routes, remaining_orders, max_orders_per_driver):
+        """Distribute remaining orders to existing routes that have capacity"""
+        while len(remaining_orders) > 0:
+            order = remaining_orders.iloc[0]
+            # Find route with minimum orders that can still fit one more
+            best_route_idx = -1
+            min_route_size = float('inf')
+            
+            for i, route in enumerate(routes):
+                if len(route) < max_orders_per_driver and len(route) < min_route_size:
+                    min_route_size = len(route)
+                    best_route_idx = i
+            
+            if best_route_idx >= 0:
+                # Add to the smallest route
+                routes[best_route_idx] = pd.concat([routes[best_route_idx], order.to_frame().T], ignore_index=True)
+            else:
+                # Create new route if all are full
+                routes.append(order.to_frame().T)
+            
+            remaining_orders = remaining_orders.drop(remaining_orders.index[0])
+    
+    def _optimize_single_route(self, orders, warehouse_coords):
+        """Optimize order sequence within a single route using nearest neighbor"""
+        if len(orders) <= 1:
+            return orders.to_dict('records')
+        
+        # Start from warehouse
+        unvisited = orders.copy()
+        route_sequence = []
+        current_lat, current_lng = warehouse_coords['lat'], warehouse_coords['lng']
+        
+        # Nearest neighbor algorithm
+        while len(unvisited) > 0:
+            distances = unvisited.apply(
+                lambda row: self._haversine_distance(
+                    current_lat, current_lng,
+                    row['delivery_lat'], row['delivery_lng']
+                ), axis=1
+            )
+            
+            nearest_idx = distances.idxmin()
+            nearest_order = unvisited.loc[nearest_idx]
+            
+            route_sequence.append(nearest_order.to_dict())
+            current_lat, current_lng = nearest_order['delivery_lat'], nearest_order['delivery_lng']
+            unvisited = unvisited.drop(nearest_idx)
+        
+        return route_sequence
+    
+    def _calculate_route_distance(self, route_orders, warehouse_coords):
+        """Calculate total distance for a route including return to warehouse"""
+        if not route_orders:
+            return 0
+        
+        total_distance = 0
+        current_lat, current_lng = warehouse_coords['lat'], warehouse_coords['lng']
+        
+        # Distance from warehouse to first order
+        first_order = route_orders[0]
+        total_distance += self._haversine_distance(
+            current_lat, current_lng,
+            first_order['delivery_lat'], first_order['delivery_lng']
+        )
+        
+        # Distance between consecutive orders
+        for i in range(1, len(route_orders)):
+            prev_order = route_orders[i-1]
+            curr_order = route_orders[i]
+            total_distance += self._haversine_distance(
+                prev_order['delivery_lat'], prev_order['delivery_lng'],
+                curr_order['delivery_lat'], curr_order['delivery_lng']
+            )
+        
+        # Distance from last order back to warehouse
+        last_order = route_orders[-1]
+        total_distance += self._haversine_distance(
+            last_order['delivery_lat'], last_order['delivery_lng'],
+            current_lat, current_lng
+        )
+        
+        return total_distance
     
     def calculate_driver_requirements(self):
         """Calculate driver requirements with rationalized efficiency improvements"""
@@ -537,6 +923,9 @@ class DeliveryOptimizer:
             # Update global maximum to include cluster data
             global_max_orders = max(global_max_orders, max_peak_cluster_orders)
             
+            # Skip route generation in map view for performance
+            cluster_routes = None
+            
             # Add delivery points from peak day clustered data colored by assigned warehouse
             sample_size_right = min(2000, len(clustered_peak_data))
             clustered_sample = clustered_peak_data.sample(n=sample_size_right, random_state=42) if len(clustered_peak_data) > sample_size_right else clustered_peak_data
@@ -630,6 +1019,66 @@ class DeliveryOptimizer:
                     hovertemplate='%{hovertext}<extra></extra>',
                     showlegend=False
                 ), row=1, col=2)
+            
+            # Add optimized routes as connected lines
+            if cluster_routes:
+                route_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9FF3', '#54A0FF']
+                route_color_idx = 0
+                
+                for cluster_id, cluster_info in cluster_routes.items():
+                    warehouse_coords = cluster_info['warehouse_coords']
+                    
+                    for route in cluster_info['routes']:
+                        route_orders = route['orders']
+                        route_color = route_colors[route_color_idx % len(route_colors)]
+                        route_color_idx += 1
+                        
+                        if len(route_orders) > 0:
+                            # Create route path: warehouse -> orders -> warehouse
+                            route_lats = [warehouse_coords['lat']]
+                            route_lngs = [warehouse_coords['lng']]
+                            
+                            for order in route_orders:
+                                route_lats.append(order['delivery_lat'])
+                                route_lngs.append(order['delivery_lng'])
+                            
+                            route_lats.append(warehouse_coords['lat'])  # Return to warehouse
+                            route_lngs.append(warehouse_coords['lng'])
+                            
+                            # Add route line
+                            fig.add_trace(go.Scattermapbox(
+                                lat=route_lats,
+                                lon=route_lngs,
+                                mode='lines',
+                                line=dict(
+                                    color=route_color,
+                                    width=3,
+                                    dash='solid'
+                                ),
+                                name=f'Route {route["route_id"]}',
+                                hovertext=f'🚚 Route {route["route_id"]}<br>📦 {route["order_count"]} orders<br>📍 {route["total_distance"]:.1f}km total<br>⏱️ Optimized sequence',
+                                hovertemplate='%{hovertext}<extra></extra>',
+                                showlegend=False,
+                                opacity=0.8
+                            ), row=1, col=2)
+                            
+                            # Add route sequence numbers
+                            for i, order in enumerate(route_orders, 1):
+                                fig.add_trace(go.Scattermapbox(
+                                    lat=[order['delivery_lat']],
+                                    lon=[order['delivery_lng']],
+                                    mode='text',
+                                    text=[f'<b>{i}</b>'],
+                                    textfont=dict(
+                                        color='white',
+                                        size=10,
+                                        family='Arial Black'
+                                    ),
+                                    textposition='middle center',
+                                    name=f'Sequence {i}',
+                                    hoverinfo='skip',
+                                    showlegend=False
+                                ), row=1, col=2)
         
         # Add enhanced warehouse markers to both maps with different prominence
         for col in [1, 2]:
@@ -716,6 +1165,137 @@ class DeliveryOptimizer:
             "type": "FeatureCollection",
             "features": features
         }
+    
+    def _create_warehouse_route_map(self, warehouse, warehouse_routes):
+        """Create a map visualization showing routes for a specific warehouse"""
+        import plotly.graph_objects as go
+        
+        if not warehouse_routes:
+            return None
+        
+        fig = go.Figure()
+        
+        # Get warehouse coordinates
+        warehouse_coords = self.warehouses[warehouse]
+        warehouse_color = self.warehouse_colors.get(warehouse, '#FF0000')
+        
+        # 15 highly contrasting colors for better visibility
+        route_colors = [
+            '#FF0000',  # Red
+            '#00FF00',  # Lime
+            '#0000FF',  # Blue
+            '#FFFF00',  # Yellow
+            '#FF00FF',  # Magenta
+            '#00FFFF',  # Cyan
+            '#FFA500',  # Orange
+            '#800080',  # Purple
+            '#008000',  # Green
+            '#FFC0CB',  # Pink
+            '#A52A2A',  # Brown
+            '#808080',  # Gray
+            '#000080',  # Navy
+            '#008080',  # Teal
+            '#DC143C'   # Crimson
+        ]
+        route_idx = 1  # Start from Route 1
+        
+        # Add warehouse marker
+        fig.add_trace(go.Scattermapbox(
+            lat=[warehouse_coords['lat']],
+            lon=[warehouse_coords['lng']],
+            mode='markers+text',
+            marker=dict(size=20, color=warehouse_color, opacity=1.0),
+            text=['⌂'],
+            textfont=dict(color='white', size=16, family='Arial Black'),
+            textposition='middle center',
+            name=f'{warehouse} Warehouse',
+            hovertext=f'⌂ {warehouse} Warehouse',
+            hovertemplate='%{hovertext}<extra></extra>'
+        ))
+        
+        # Add routes for each cluster with consistent color mapping
+        # First, sort clusters and assign route numbers consistently
+        sorted_clusters = sorted(warehouse_routes.items())
+        
+        for cluster_id, cluster_info in sorted_clusters:
+            # Sort routes by their geographic center to minimize overlaps
+            routes_with_centers = []
+            for i, route in enumerate(cluster_info['routes']):
+                route_orders = route['orders']
+                if len(route_orders) > 0:
+                    # Calculate route center
+                    center_lat = sum(order['delivery_lat'] for order in route_orders) / len(route_orders)
+                    center_lng = sum(order['delivery_lng'] for order in route_orders) / len(route_orders)
+                    routes_with_centers.append((route, center_lat, center_lng, i))
+            
+            # Sort by geographic position to reduce visual overlap
+            routes_with_centers.sort(key=lambda x: (x[1], x[2]))  # Sort by lat, then lng
+            
+            for route, center_lat, center_lng, original_idx in routes_with_centers:
+                route_orders = route['orders']
+                route_color = route_colors[(route_idx - 1) % len(route_colors)]
+                
+                if len(route_orders) > 0:
+                    # Create optimized route path: warehouse -> orders -> warehouse
+                    route_lats = [warehouse_coords['lat']]
+                    route_lngs = [warehouse_coords['lng']]
+                    
+                    for order in route_orders:
+                        route_lats.append(order['delivery_lat'])
+                        route_lngs.append(order['delivery_lng'])
+                    
+                    route_lats.append(warehouse_coords['lat'])  # Return to warehouse
+                    route_lngs.append(warehouse_coords['lng'])
+                    
+                    # Add route line with cluster context in name
+                    fig.add_trace(go.Scattermapbox(
+                        lat=route_lats,
+                        lon=route_lngs,
+                        mode='lines',
+                        line=dict(color=route_color, width=4),  # Slightly thicker for better visibility
+                        name=f'Route {route_idx} (C{cluster_id})',
+                        hovertext=f'🚚 Route {route_idx}<br>📍 Cluster {cluster_id}<br>📦 {route["order_count"]} orders<br>👤 {route["driver_id"]}',
+                        hovertemplate='%{hovertext}<extra></extra>',
+                        opacity=0.9
+                    ))
+                    
+                    # Add delivery point markers with consistent colors
+                    delivery_lats = [order['delivery_lat'] for order in route_orders]
+                    delivery_lngs = [order['delivery_lng'] for order in route_orders]
+                    delivery_texts = [f'{j+1}' for j in range(len(route_orders))]
+                    
+                    fig.add_trace(go.Scattermapbox(
+                        lat=delivery_lats,
+                        lon=delivery_lngs,
+                        mode='markers+text',
+                        marker=dict(size=14, color=route_color, opacity=0.9),  # Removed line property
+                        text=delivery_texts,
+                        textfont=dict(color='white', size=10, family='Arial Black'),
+                        textposition='middle center',
+                        name=f'R{route_idx} Stops',
+                        hovertext=[f'📦 Stop {j+1}<br>🚚 Route {route_idx} (Cluster {cluster_id})<br>👤 {route["driver_id"]}<br>📍 Order: {order.get("order_id", "N/A")}' 
+                                  for j, order in enumerate(route_orders)],
+                        hovertemplate='%{hovertext}<extra></extra>',
+                        showlegend=False
+                    ))
+                    
+                    route_idx += 1  # Increment route counter
+        
+        # Update map layout
+        fig.update_layout(
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=warehouse_coords['lat'], lon=warehouse_coords['lng']),
+                zoom=11
+            ),
+            height=600,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            title=f"Route Visualization for {warehouse}",
+            margin=dict(l=0, r=0, t=40, b=0)
+        )
+        
+        return fig
 
 def main():
     """Main Streamlit application"""
@@ -751,7 +1331,12 @@ def main():
                     clustered_df = optimizer.create_clusters(n_clusters)
                     if clustered_df is not None:
                         st.session_state.clusters_created = True
+                        # Clear route optimization cache when new clusters are created
+                        if 'route_optimization_cache' in st.session_state:
+                            st.session_state.route_optimization_cache = {}
                         st.success(f"✅ Created {n_clusters} clusters")
+            
+            # Route analysis will be available as separate tab after clustering
         else:
             st.info("Upload data to see clustering options")
     
@@ -841,338 +1426,436 @@ def main():
     # Main content area
     elif hasattr(st.session_state, 'data_loaded') and optimizer.df is not None:
         
-        # Only show maps after clusters are created
+        # Only show content after clusters are created
         if hasattr(st.session_state, 'clusters_created'):
-            # Display comparison maps
-            fig, peak_day, peak_day_count = optimizer.create_comparison_maps()
-            st.plotly_chart(fig, use_container_width=True)
+            # Create main tabs
+            tab1, tab2 = st.tabs(["🎯 Clusters", "🚚 Routes"])
             
-            # Add warehouse color legend
-            st.markdown("### 🎨 Warehouse Color Legend")
-            legend_cols = st.columns(len(optimizer.warehouse_colors))
-            for i, (warehouse, color) in enumerate(optimizer.warehouse_colors.items()):
-                with legend_cols[i]:
-                    st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:20px;height:20px;background-color:{color};margin-right:8px;border:2px solid white;"></div><small><b>{warehouse}</b></small></div>', unsafe_allow_html=True)
-            
-            # Add bubble size legend with enhanced visibility explanation
-            st.markdown("### 📏 Order Count Legend (Enhanced Bubble Sizes)")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            # Get order count ranges from the data
-            if optimizer.df is not None:
-                daily_totals = optimizer.df.groupby('date').size()
-                peak_day = daily_totals.idxmax()
-                peak_day_data = optimizer.df[optimizer.df['date'] == peak_day]
+            with tab1:
+                # Display comparison maps
+                fig, peak_day, peak_day_count = optimizer.create_comparison_maps()
+                st.plotly_chart(fig, use_container_width=True)
                 
-                # Calculate order counts by pincode for legend
-                pincode_counts = peak_day_data.groupby('postcode').size()
-                if len(pincode_counts) > 0:
-                    min_orders = int(pincode_counts.min())
-                    max_orders = int(pincode_counts.max())
-                    q25_orders = int(pincode_counts.quantile(0.25))
-                    q75_orders = int(pincode_counts.quantile(0.75))
-                    
-                    with col1:
-                        st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:16px;height:16px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{min_orders} orders</b></small></div>', unsafe_allow_html=True)
-                    
-                    with col2:
-                        st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:22px;height:22px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{q25_orders} orders</b></small></div>', unsafe_allow_html=True)
-                    
-                    with col3:
-                        st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:28px;height:28px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{q75_orders} orders</b></small></div>', unsafe_allow_html=True)
-                    
-                    with col4:
-                        st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:40px;height:40px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{max_orders} orders</b></small></div>', unsafe_allow_html=True)
+                # Add warehouse color legend
+                st.markdown("### 🎨 Warehouse Color Legend")
+                legend_cols = st.columns(len(optimizer.warehouse_colors))
+                for i, (warehouse, color) in enumerate(optimizer.warehouse_colors.items()):
+                    with legend_cols[i]:
+                        st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:20px;height:20px;background-color:{color};margin-right:8px;border:2px solid white;"></div><small><b>{warehouse}</b></small></div>', unsafe_allow_html=True)
                 
-                st.markdown("**💡 Tip**: Left map now shows enhanced visibility with larger bubbles, thicker borders, and density-based point sizes for clearer order distribution comparison.")
-            
-            # Map explanation with peak day analysis
-            st.info(f"📊 **Peak Day Analysis**: Both maps show identical {peak_day_count:,} orders from peak day ({peak_day}) | **Left Map**: Current pincode-hub assignments with enhanced visibility | **Right Map**: Optimized geographic clusters | **Bubbles & Numbers** = order count with density-based sizing | **Colored regions** = delivery zones | **Houses** ⌂ = Warehouses")
-        else:
-            st.info("👆 **Create clusters using the sidebar to see the comparison visualization.**")
-        
-        # Driver requirements analysis (only if clusters are created)
-        if hasattr(st.session_state, 'clusters_created'):
-            st.divider()
-            st.subheader("📊 Driver Requirements Analysis")
-            
-            # Get driver requirements data first before showing rationale
-            current_summary, clustered_summary = optimizer.calculate_driver_requirements()
-            
-            # Initialize variables to avoid UnboundLocalError
-            total_current_median = total_current_peak = 0
-            total_optimized_median = total_optimized_peak = 0
-            total_theoretical_median = total_theoretical_peak = 0
-            
-            if current_summary is not None and clustered_summary is not None:
-                # Calculate totals early
-                total_current_median = current_summary['drivers_used_median'].sum()
-                total_current_peak = current_summary['drivers_used_max'].sum()
-                total_optimized_median = clustered_summary['drivers_required_median'].sum()
-                total_optimized_peak = clustered_summary['drivers_required_max'].sum()
-                total_theoretical_median = current_summary['drivers_theoretical_median'].sum()
-                total_theoretical_peak = current_summary['drivers_theoretical_max'].sum()
-            
-            # Show capacity rationale if available
-            if hasattr(st.session_state, 'capacity_rationale') and current_summary is not None:
-                rationale = st.session_state.capacity_rationale
-                
-                with st.expander("🧮 Driver Capacity Rationale - Click to Expand", expanded=False):
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.markdown("**🔴 Current System (Actual)**")
-                        actual_efficiency = (current_summary['orders_median'] / current_summary['drivers_used_median']).mean()
-                        st.write(f"• **Actual Efficiency:** {actual_efficiency:.1f} orders/driver/day")
-                        st.write(f"• **Theoretical:** {rationale['current_capacity']} orders/driver/day")
-                        st.write(f"• **Avg Distance:** {rationale['current_avg_distance']:.2f} km/order")
-                        st.write(f"• **Issue:** Scattered pincode deliveries")
-                    
-                    with col2:
-                        st.markdown("**🟢 Optimized System**")
-                        st.write(f"• **Capacity:** {rationale['optimized_capacity']} orders/driver/day")
-                        st.write(f"• **Avg Distance:** {rationale['optimized_avg_distance']:.2f} km/order")
-                        st.write(f"• **Benefit:** Geographic clustering")
-                    
-                    with col3:
-                        st.markdown("**📈 Efficiency Gain**")
-                        st.write(f"• **Improvement:** {rationale['efficiency_improvement']:.1f}%")
-                        distance_reduction = ((rationale['current_avg_distance'] - rationale['optimized_avg_distance']) / rationale['current_avg_distance'] * 100) if rationale['current_avg_distance'] > 0 else 0
-                        st.write(f"• **Distance Saved:** {distance_reduction:.1f}%")
-                        st.write(f"• **Logic:** Shorter routes = More deliveries")
-                    
-                    st.info("💡 **Rationale:** Analysis uses ACTUAL driver counts from the current system vs projected requirements for optimized system. Current system shows real driver utilization while optimized system uses distance-based efficiency calculations capped at 50% improvement for realistic projections.")
-            
-            current_summary, clustered_summary = optimizer.calculate_driver_requirements()
-            
-            # Initialize variables to avoid UnboundLocalError
-            total_current_median = total_current_peak = 0
-            total_optimized_median = total_optimized_peak = 0
-            total_theoretical_median = total_theoretical_peak = 0
-            
-            if current_summary is not None and clustered_summary is not None:
-                # Calculate totals early
-                total_current_median = current_summary['drivers_used_median'].sum()
-                total_current_peak = current_summary['drivers_used_max'].sum()
-                total_optimized_median = clustered_summary['drivers_required_median'].sum()
-                total_optimized_peak = clustered_summary['drivers_required_max'].sum()
-                total_theoretical_median = current_summary['drivers_theoretical_median'].sum()
-                total_theoretical_peak = current_summary['drivers_theoretical_max'].sum()
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("**🔴 Current System (Actual Driver Usage)**")
-                    current_display = pd.DataFrame({
-                        'Hub': current_summary.index,
-                        'Median Orders/Day': current_summary['orders_median'].values,
-                        'Peak Orders/Day': current_summary['orders_max'].values,
-                        'Actual Drivers (Median)': current_summary['drivers_used_median'].values.astype(int),
-                        'Actual Drivers (Peak)': current_summary['drivers_used_max'].values.astype(int),
-                        'Vehicles (Peak)': current_summary['unique_vehicles_max'].values.astype(int)
-                    })
-                    st.dataframe(current_display, hide_index=True)
-                    
-                    # Show efficiency metrics
-                    actual_efficiency = (current_summary['orders_median'] / current_summary['drivers_used_median']).mean()
-                    st.info(f"📊 Current Efficiency: {actual_efficiency:.1f} orders/driver/day (actual data)")
-                
-                with col2:
-                    st.markdown("**🟢 Optimized System (Projected Requirements)**")
-                    clustered_display = pd.DataFrame({
-                        'Warehouse': clustered_summary.index,
-                        'Median Orders/Day': clustered_summary['orders_median'].values,
-                        'Peak Orders/Day': clustered_summary['orders_max'].values,
-                        'Required Drivers (Median)': clustered_summary['drivers_required_median'].values.astype(int),
-                        'Required Drivers (Peak)': clustered_summary['drivers_required_max'].values.astype(int)
-                    })
-                    st.dataframe(clustered_display, hide_index=True)
-                    
-                    # Show projected efficiency
-                    projected_efficiency = optimized_capacity if 'optimized_capacity' in locals() else 30
-                    st.info(f"📊 Projected Efficiency: {projected_efficiency} orders/driver/day (optimized clusters)")
-                
-                # Actual vs Theoretical Analysis
-                st.divider()
-                st.markdown("### 📏 Actual vs Projected Driver Usage")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric(
-                        "Current (Actual)",
-                        f"{int(total_current_peak)} drivers",
-                        f"Peak day usage"
-                    )
-                
-                with col2:
-                    st.metric(
-                        "Current (Theoretical)", 
-                        f"{int(total_theoretical_peak)} drivers",
-                        f"{int(total_theoretical_peak - total_current_peak):+d} vs actual"
-                    )
-                
-                with col3:
-                    actual_efficiency_pct = (total_current_peak / total_theoretical_peak * 100) if total_theoretical_peak > 0 else 0
-                    st.metric(
-                        "Current Efficiency",
-                        f"{actual_efficiency_pct:.0f}%",
-                        f"Driver utilization rate"
-                    )
-                
-                # Main comparison metrics
-                st.divider()
+                # Add bubble size legend with enhanced visibility explanation
+                st.markdown("### 📏 Order Count Legend (Enhanced Bubble Sizes)")
                 col1, col2, col3, col4 = st.columns(4)
                 
-                # Variables already calculated above
+                # Get order count ranges from the data
+                if optimizer.df is not None:
+                    daily_totals = optimizer.df.groupby('date').size()
+                    peak_day = daily_totals.idxmax()
+                    peak_day_data = optimizer.df[optimizer.df['date'] == peak_day]
+                    
+                    # Calculate order counts by pincode for legend
+                    pincode_counts = peak_day_data.groupby('postcode').size()
+                    if len(pincode_counts) > 0:
+                        min_orders = int(pincode_counts.min())
+                        max_orders = int(pincode_counts.max())
+                        q25_orders = int(pincode_counts.quantile(0.25))
+                        q75_orders = int(pincode_counts.quantile(0.75))
+                        
+                        with col1:
+                            st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:16px;height:16px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{min_orders} orders</b></small></div>', unsafe_allow_html=True)
+                        
+                        with col2:
+                            st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:22px;height:22px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{q25_orders} orders</b></small></div>', unsafe_allow_html=True)
+                        
+                        with col3:
+                            st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:28px;height:28px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{q75_orders} orders</b></small></div>', unsafe_allow_html=True)
+                        
+                        with col4:
+                            st.markdown(f'<div style="display:flex;align-items:center;"><div style="width:40px;height:40px;background-color:#666;border-radius:50%;margin-right:8px;border:2px solid white;"></div><small><b>{max_orders} orders</b></small></div>', unsafe_allow_html=True)
+                    
+                    st.markdown("**💡 Tip**: Left map now shows enhanced visibility with larger bubbles, thicker borders, and density-based point sizes for clearer order distribution comparison.")
                 
-                with col1:
-                    st.metric(
-                        "Optimized (Median)",
-                        f"{int(total_optimized_median)} drivers",
-                        f"{int(total_optimized_median - total_current_median):+d} vs actual current"
-                    )
+                # Map explanation with peak day analysis
+                st.info(f"📊 **Peak Day Analysis**: Both maps show identical {peak_day_count:,} orders from peak day ({peak_day}) | **Left Map**: Current pincode-hub assignments with enhanced visibility | **Right Map**: Optimized geographic clusters | **Bubbles & Numbers** = order count with density-based sizing | **Colored regions** = delivery zones | **Houses** ⌂ = Warehouses")
                 
-                with col2:
-                    st.metric(
-                        "Optimized (Peak)",
-                        f"{int(total_optimized_peak)} drivers",
-                        f"{int(total_optimized_peak - total_current_peak):+d} vs actual current"
-                    )
-                
-                with col3:
-                    median_reduction = (total_current_median - total_optimized_median) / total_current_median * 100 if total_current_median > 0 else 0
-                    st.metric(
-                        "Median Day Savings",
-                        f"{median_reduction:.1f}%",
-                        f"{int(total_current_median - total_optimized_median)} driver reduction"
-                    )
-                
-                with col4:
-                    peak_reduction = (total_current_peak - total_optimized_peak) / total_current_peak * 100 if total_current_peak > 0 else 0
-                    st.metric(
-                        "Peak Day Savings",
-                        f"{peak_reduction:.1f}%",
-                        f"{int(total_current_peak - total_optimized_peak)} driver reduction"
-                    )
-                
-                # Distance analysis section
+                # Driver requirements analysis (only if clusters are created)
                 st.divider()
-                st.subheader("🚗 Distance Traveled Analysis")
+                st.subheader("📊 Driver Requirements Analysis")
                 
-                current_distances, optimized_distances = optimizer.calculate_distance_traveled()
+                # Get driver requirements data first before showing rationale
+                current_summary, clustered_summary = optimizer.calculate_driver_requirements()
                 
-                if current_distances and optimized_distances:
+                # Initialize variables to avoid UnboundLocalError
+                total_current_median = total_current_peak = 0
+                total_optimized_median = total_optimized_peak = 0
+                total_theoretical_median = total_theoretical_peak = 0
+                
+                if current_summary is not None and clustered_summary is not None:
+                    # Calculate totals early
+                    total_current_median = current_summary['drivers_used_median'].sum()
+                    total_current_peak = current_summary['drivers_used_max'].sum()
+                    total_optimized_median = clustered_summary['drivers_required_median'].sum()
+                    total_optimized_peak = clustered_summary['drivers_required_max'].sum()
+                    total_theoretical_median = current_summary['drivers_theoretical_median'].sum()
+                    total_theoretical_peak = current_summary['drivers_theoretical_max'].sum()
+                
+                # Show capacity rationale if available
+                if hasattr(st.session_state, 'capacity_rationale') and current_summary is not None:
+                    rationale = st.session_state.capacity_rationale
+                    
+                    with st.expander("🧮 Driver Capacity Rationale - Click to Expand", expanded=False):
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.markdown("**🔴 Current System (Actual)**")
+                            actual_efficiency = (current_summary['orders_median'] / current_summary['drivers_used_median']).mean()
+                            st.write(f"• **Actual Efficiency:** {actual_efficiency:.1f} orders/driver/day")
+                            st.write(f"• **Theoretical:** {rationale['current_capacity']} orders/driver/day")
+                            st.write(f"• **Avg Distance:** {rationale['current_avg_distance']:.2f} km/order")
+                            st.write(f"• **Issue:** Scattered pincode deliveries")
+                        
+                        with col2:
+                            st.markdown("**🟢 Optimized System**")
+                            st.write(f"• **Capacity:** {rationale['optimized_capacity']} orders/driver/day")
+                            st.write(f"• **Avg Distance:** {rationale['optimized_avg_distance']:.2f} km/order")
+                            st.write(f"• **Benefit:** Geographic clustering")
+                        
+                        with col3:
+                            st.markdown("**📈 Efficiency Gain**")
+                            st.write(f"• **Improvement:** {rationale['efficiency_improvement']:.1f}%")
+                            distance_reduction = ((rationale['current_avg_distance'] - rationale['optimized_avg_distance']) / rationale['current_avg_distance'] * 100) if rationale['current_avg_distance'] > 0 else 0
+                            st.write(f"• **Distance Saved:** {distance_reduction:.1f}%")
+                            st.write(f"• **Logic:** Shorter routes = More deliveries")
+                        
+                        st.info("💡 **Rationale:** Analysis uses ACTUAL driver counts from the current system vs projected requirements for optimized system. Current system shows real driver utilization while optimized system uses distance-based efficiency calculations capped at 50% improvement for realistic projections.")
+                
+                current_summary, clustered_summary = optimizer.calculate_driver_requirements()
+                
+                # Initialize variables to avoid UnboundLocalError
+                total_current_median = total_current_peak = 0
+                total_optimized_median = total_optimized_peak = 0
+                total_theoretical_median = total_theoretical_peak = 0
+                
+                if current_summary is not None and clustered_summary is not None:
+                    # Calculate totals early
+                    total_current_median = current_summary['drivers_used_median'].sum()
+                    total_current_peak = current_summary['drivers_used_max'].sum()
+                    total_optimized_median = clustered_summary['drivers_required_median'].sum()
+                    total_optimized_peak = clustered_summary['drivers_required_max'].sum()
+                    total_theoretical_median = current_summary['drivers_theoretical_median'].sum()
+                    total_theoretical_peak = current_summary['drivers_theoretical_max'].sum()
+                    
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        st.markdown("**🔴 Current System - Distance per Hub**")
-                        current_dist_df = pd.DataFrame([
-                            {
-                                'Hub': hub,
-                                'Total Distance (km)': f"{data['total_distance_km']:.1f}",
-                                'Avg Distance (km)': f"{data['avg_distance_km']:.1f}",
-                                'Max Distance (km)': f"{data['max_distance_km']:.1f}",
-                                'Orders': data['order_count']
-                            }
-                            for hub, data in current_distances.items()
-                        ])
-                        st.dataframe(current_dist_df, hide_index=True)
+                        st.markdown("**🔴 Current System (Actual Driver Usage)**")
+                        current_display = pd.DataFrame({
+                            'Hub': current_summary.index,
+                            'Median Orders/Day': current_summary['orders_median'].values,
+                            'Peak Orders/Day': current_summary['orders_max'].values,
+                            'Actual Drivers (Median)': current_summary['drivers_used_median'].values.astype(int),
+                            'Actual Drivers (Peak)': current_summary['drivers_used_max'].values.astype(int),
+                            'Vehicles (Peak)': current_summary['unique_vehicles_max'].values.astype(int)
+                        })
+                        st.dataframe(current_display, hide_index=True)
+                        
+                        # Show efficiency metrics
+                        actual_efficiency = (current_summary['orders_median'] / current_summary['drivers_used_median']).mean()
+                        st.info(f"📊 Current Efficiency: {actual_efficiency:.1f} orders/driver/day (actual data)")
                     
                     with col2:
-                        st.markdown("**🟢 Optimized System - Distance per Warehouse**")
-                        optimized_dist_df = pd.DataFrame([
-                            {
-                                'Warehouse': warehouse,
-                                'Total Distance (km)': f"{data['total_distance_km']:.1f}",
-                                'Avg Distance (km)': f"{data['avg_distance_km']:.1f}",
-                                'Max Distance (km)': f"{data['max_distance_km']:.1f}",
-                                'Orders': data['order_count']
-                            }
-                            for warehouse, data in optimized_distances.items()
-                        ])
-                        st.dataframe(optimized_dist_df, hide_index=True)
+                        st.markdown("**🟢 Optimized System (Projected Requirements)**")
+                        clustered_display = pd.DataFrame({
+                            'Warehouse': clustered_summary.index,
+                            'Median Orders/Day': clustered_summary['orders_median'].values,
+                            'Peak Orders/Day': clustered_summary['orders_max'].values,
+                            'Required Drivers (Median)': clustered_summary['drivers_required_median'].values.astype(int),
+                            'Required Drivers (Peak)': clustered_summary['drivers_required_max'].values.astype(int)
+                        })
+                        st.dataframe(clustered_display, hide_index=True)
+                        
+                        # Show efficiency metrics for optimized system
+                        optimized_efficiency = (clustered_summary['orders_median'] / clustered_summary['drivers_required_median']).mean()
+                        st.info(f"📊 Optimized Efficiency: {optimized_efficiency:.1f} orders/driver/day (projected)")
                     
-                    # Distance comparison metrics
+                    # Summary comparison metrics
                     st.divider()
                     col1, col2, col3, col4 = st.columns(4)
                     
-                    total_current_dist = sum(data['total_distance_km'] for data in current_distances.values())
-                    total_optimized_dist = sum(data['total_distance_km'] for data in optimized_distances.values())
-                    avg_current_dist = sum(data['avg_distance_km'] * data['order_count'] for data in current_distances.values()) / sum(data['order_count'] for data in current_distances.values())
-                    avg_optimized_dist = sum(data['avg_distance_km'] * data['order_count'] for data in optimized_distances.values()) / sum(data['order_count'] for data in optimized_distances.values())
+                    with col1:
+                        st.metric("**Current Drivers (Median)**", total_current_median)
+                    with col2:
+                        st.metric("**Optimized Drivers (Median)**", total_optimized_median, delta=int(total_optimized_median - total_current_median))
+                    with col3:
+                        reduction_pct = ((total_current_median - total_optimized_median) / total_current_median * 100) if total_current_median > 0 else 0
+                        st.metric("**Reduction**", f"{reduction_pct:.1f}%")
+                    with col4:
+                        monthly_savings = (total_current_median - total_optimized_median) * 30 * 900
+                        st.metric("**Monthly Savings**", f"₹{monthly_savings:,.0f}")
+                    
+                    # Peak day comparison
+                    st.markdown("### 📈 Peak Day Comparison")
+                    col1, col2, col3, col4 = st.columns(4)
                     
                     with col1:
-                        st.metric(
-                            "Total Distance Reduction",
-                            f"{total_optimized_dist:.0f} km",
-                            f"{total_optimized_dist - total_current_dist:.0f} km vs current"
-                        )
-                    
+                        st.metric("**Current (Peak)**", total_current_peak)
                     with col2:
-                        distance_reduction_pct = (total_current_dist - total_optimized_dist) / total_current_dist * 100 if total_current_dist > 0 else 0
-                        st.metric(
-                            "Distance Reduction %",
-                            f"{distance_reduction_pct:.1f}%",
-                            f"{total_current_dist - total_optimized_dist:.0f} km saved"
-                        )
-                    
+                        st.metric("**Optimized (Peak)**", total_optimized_peak, delta=int(total_optimized_peak - total_current_peak))
                     with col3:
-                        st.metric(
-                            "Avg Distance/Order",
-                            f"{avg_optimized_dist:.1f} km",
-                            f"{avg_optimized_dist - avg_current_dist:.1f} km vs current"
-                        )
-                    
+                        peak_reduction_pct = ((total_current_peak - total_optimized_peak) / total_current_peak * 100) if total_current_peak > 0 else 0
+                        st.metric("**Peak Reduction**", f"{peak_reduction_pct:.1f}%")
                     with col4:
-                        fuel_savings = (total_current_dist - total_optimized_dist) * 0.1  # Assuming 0.1L/km fuel consumption
-                        st.metric(
-                            "Fuel Savings (Est.)",
-                            f"{fuel_savings:.0f} L",
-                            f"₹{fuel_savings * 100:.0f} saved" if fuel_savings > 0 else "₹0"
-                        )
+                        peak_savings = (total_current_peak - total_optimized_peak) * 30 * 900
+                        st.metric("**Peak Savings/Month**", f"₹{peak_savings:,.0f}")
                 
-                # Export section
-                st.divider()
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("📥 Download Cluster Boundaries")
-                    if st.button("Generate GeoJSON"):
-                        geojson_data = optimizer.export_cluster_geojson()
-                        if geojson_data:
-                            geojson_str = json.dumps(geojson_data, indent=2)
-                            st.download_button(
-                                "📥 Download GeoJSON",
-                                geojson_str,
-                                "optimized_clusters.geojson",
-                                "application/json"
-                            )
-                            st.success("✅ Ready for download!")
-                
-                with col2:
-                    st.subheader("📈 Key Improvements")
-                    if optimizer.clustered_df is not None:
-                        cluster_summary = optimizer.clustered_df.groupby(['cluster_id', 'assigned_warehouse']).agg({
-                            'order_id': 'count',
-                            'distance_to_center_km': 'mean'
-                        }).reset_index()
-                        
-                        st.write(f"• **{len(cluster_summary)}** optimized delivery zones")
-                        st.write(f"• **{cluster_summary['distance_to_center_km'].mean():.1f}km** average delivery distance")
-                        
-                        # Only show driver savings if variables are available
-                        if total_current_median > 0 and total_optimized_median > 0:
-                            st.write(f"• **{int(total_current_median - total_optimized_median)}** fewer drivers on median days")
-                        
-                        st.write(f"• **{cluster_summary['order_id'].sum():,}** total orders optimized")
-                    else:
-                        st.info("Cluster data not available")
+                else:
+                    st.info("No driver data available")
+        
             
-            else:
-                st.info("Driver analysis available after creating clusters")
+            with tab2:
+                st.header("🗺️ Detailed Route Analysis by Hub & Zone")
+                st.markdown("**Driver Batching Logic:** Minimize drivers with 22-30 orders per route (4 hours max, 40km max, directional routing: NE/NW/SE/SW/Central)")
+                
+                if optimizer.clustered_df is not None:
+                    # Use SAME peak day data as Map Analysis tab for consistency
+                    daily_totals = optimizer.clustered_df.groupby('date').size()
+                    peak_day = daily_totals.idxmax()
+                    peak_day_clustered = optimizer.clustered_df[optimizer.clustered_df['date'] == peak_day].copy()
+                    
+                    st.info(f"📊 **Route Analysis for Peak Day**: {peak_day} ({len(peak_day_clustered):,} orders) - Same data as Map Analysis")
+                    
+                    # Get available warehouses from PEAK DAY clustered data
+                    available_warehouses = sorted(peak_day_clustered['assigned_warehouse'].unique())
+                    
+                    # Initialize session state for route optimization
+                    if 'route_optimization_cache' not in st.session_state:
+                        st.session_state.route_optimization_cache = {}
+                    
+                    # Show warehouse selection for lazy loading
+                    st.subheader("📍 Select Warehouse to Analyze Routes")
+                    
+                    # Warehouse selection tabs
+                    warehouse_tabs = st.tabs([f"🏪 {warehouse}" for warehouse in available_warehouses])
+                    
+                    for i, warehouse in enumerate(available_warehouses):
+                        with warehouse_tabs[i]:
+                            st.subheader(f"Route Analysis for {warehouse} - Peak Day {peak_day}")
+                            
+                            # Get clusters for this warehouse from PEAK DAY data only
+                            warehouse_clusters = peak_day_clustered[
+                                peak_day_clustered['assigned_warehouse'] == warehouse
+                            ]['cluster_id'].unique()
+                            
+                            # Show warehouse summary first using PEAK DAY data
+                            warehouse_orders = peak_day_clustered[
+                                peak_day_clustered['assigned_warehouse'] == warehouse
+                            ]
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.info(f"**Total Orders:** {len(warehouse_orders):,}")
+                            with col2:
+                                st.info(f"**Clusters:** {len(warehouse_clusters)}")
+                            
+                            # Button to optimize routes for this warehouse only (peak day)
+                            # Include cluster count in cache key to invalidate when clusters change
+                            n_clusters_current = len(peak_day_clustered['cluster_id'].unique())
+                            cache_key = f"routes_{warehouse}_{peak_day}_{n_clusters_current}"
+                            
+                            if st.button(f"🚀 Optimize Routes for {warehouse}", key=f"optimize_{warehouse}"):
+                                with st.spinner(f"Optimizing routes for {warehouse}... This may take 30-60 seconds"):
+                                    # Optimize routes for this warehouse's clusters only
+                                    warehouse_cluster_routes = {}
+                                    
+                                    for cluster_id in warehouse_clusters:
+                                        cluster_data = peak_day_clustered[peak_day_clustered['cluster_id'] == cluster_id].copy()
+                                        warehouse_coords = optimizer.warehouses[warehouse]
+                                        
+                                        # Create driver routes with realistic constraints
+                                        routes = optimizer._create_driver_batches(
+                                            cluster_data, 
+                                            warehouse_coords, 
+                                            40,  # max_distance_per_route
+                                            4,   # max_time_hours
+                                            5,   # delivery_time_per_order
+                                            25   # avg_speed_kmh
+                                        )
+                                        
+                                        warehouse_cluster_routes[cluster_id] = {
+                                            'warehouse': warehouse,
+                                            'warehouse_coords': warehouse_coords,
+                                            'routes': [],
+                                            'drivers_needed': len(routes)
+                                        }
+                                        
+                                        for j, route_orders in enumerate(routes):
+                                            optimized_route = optimizer._optimize_single_route(route_orders, warehouse_coords)
+                                            route_distance = optimizer._calculate_route_distance(optimized_route, warehouse_coords)
+                                            route_time = (route_distance / 25) + (len(optimized_route) * 5 / 60)
+                                            
+                                            warehouse_cluster_routes[cluster_id]['routes'].append({
+                                                'route_id': f"R{cluster_id}-{j+1}",
+                                                'driver_id': f"Driver-{cluster_id}-{j+1}",
+                                                'orders': optimized_route,
+                                                'total_distance': route_distance,
+                                                'total_time_hours': route_time,
+                                                'order_count': len(optimized_route),
+                                                'efficiency_score': len(optimized_route) / route_distance if route_distance > 0 else 0
+                                            })
+                                    
+                                    # Cache the results
+                                    st.session_state.route_optimization_cache[cache_key] = warehouse_cluster_routes
+                                    st.success(f"✅ Routes optimized for {warehouse}")
+                            
+                            # Display cached results if available
+                            if cache_key in st.session_state.route_optimization_cache:
+                                warehouse_routes = st.session_state.route_optimization_cache[cache_key]
+                                
+                                if warehouse_routes:
+                                    # Calculate warehouse totals
+                                    total_orders = sum(
+                                        route['order_count'] 
+                                        for cluster_info in warehouse_routes.values() 
+                                        for route in cluster_info['routes']
+                                    )
+                                    total_routes = sum(len(cluster_info['routes']) for cluster_info in warehouse_routes.values())
+                                    total_distance = sum(
+                                        route['total_distance'] 
+                                        for cluster_info in warehouse_routes.values() 
+                                        for route in cluster_info['routes']
+                                    )
+                                    
+                                    # Show warehouse summary
+                                    st.markdown("### 📊 Route Summary")
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("**Orders**", f"{total_orders:,}")
+                                    with col2:
+                                        st.metric("**Routes**", f"{total_routes}")
+                                    with col3:
+                                        total_clusters = len(warehouse_routes)
+                                        st.metric("**Clusters**", f"{total_clusters}")
+                                    with col4:
+                                        avg_orders_per_route = total_orders / total_routes if total_routes > 0 else 0
+                                        st.metric("**Avg Orders/Route**", f"{avg_orders_per_route:.1f}")
+                                    
+                                    # Show route visualization map
+                                    st.markdown("### 🗺️ Route Visualization")
+                                    route_map = optimizer._create_warehouse_route_map(warehouse, warehouse_routes)
+                                    if route_map:
+                                        st.plotly_chart(route_map, use_container_width=True)
+                                    else:
+                                        st.info("Route map will appear here after optimization")
+                                    
+                                    # Show detailed cluster-to-route mapping
+                                    st.markdown("### 🎯 Cluster-to-Route Mapping")
+                                    st.markdown(f"**Hub Coverage:** {warehouse} serves {len(warehouse_routes)} clusters with detailed route breakdown:")
+                                    
+                                    # Create a comprehensive mapping table first
+                                    cluster_mapping_data = []
+                                    global_route_counter = 1
+                                    
+                                    # Define 15 highly contrasting colors for route visualization
+                                    route_colors = [
+                                        '#FF0000',  # Red
+                                        '#00FF00',  # Lime
+                                        '#0000FF',  # Blue
+                                        '#FFFF00',  # Yellow
+                                        '#FF00FF',  # Magenta
+                                        '#00FFFF',  # Cyan
+                                        '#FFA500',  # Orange
+                                        '#800080',  # Purple
+                                        '#008000',  # Green
+                                        '#FFC0CB',  # Pink
+                                        '#A52A2A',  # Brown
+                                        '#808080',  # Gray
+                                        '#000080',  # Navy
+                                        '#008080',  # Teal
+                                        '#DC143C'   # Crimson
+                                    ]
+                                    
+                                    for cluster_id, cluster_info in sorted(warehouse_routes.items()):
+                                        cluster_orders = sum(route['order_count'] for route in cluster_info['routes'])
+                                        cluster_routes_count = len(cluster_info['routes'])
+                                        
+                                        # Add main cluster row
+                                        cluster_mapping_data.append({
+                                            'Type': '📍 Cluster',
+                                            'ID': f'Cluster {cluster_id}',
+                                            'Orders': cluster_orders,
+                                            'Routes': cluster_routes_count,
+                                            'Details': f'{cluster_routes_count} routes, {cluster_orders} orders'
+                                        })
+                                        
+                                        # Add individual routes for this cluster
+                                        for j, route in enumerate(cluster_info['routes'], 1):
+                                            cluster_mapping_data.append({
+                                                'Type': '  └── 🚚 Route',
+                                                'ID': f'Route {global_route_counter}',
+                                                'Orders': route['order_count'],
+                                                'Routes': '',
+                                                'Details': f"Driver: {route['driver_id']}"
+                                            })
+                                            global_route_counter += 1
+                                    
+                                    # Display the mapping table
+                                    if cluster_mapping_data:
+                                        mapping_df = pd.DataFrame(cluster_mapping_data)
+                                        st.dataframe(mapping_df, hide_index=True, use_container_width=True)
+                                    
+                                    # Show expandable detailed view for each cluster
+                                    st.markdown("### 📊 Detailed Cluster Analysis")
+                                    for cluster_id, cluster_info in sorted(warehouse_routes.items()):
+                                        cluster_orders = sum(route['order_count'] for route in cluster_info['routes'])
+                                        cluster_routes_count = len(cluster_info['routes'])
+                                        
+                                        with st.expander(f"🎯 Cluster {cluster_id} - {cluster_orders} orders, {cluster_routes_count} routes", expanded=False):
+                                            
+                                            # Show routes within this specific cluster
+                                            routes_data = []
+                                            for j, route in enumerate(cluster_info['routes'], 1):
+                                                # Find the global route number for this route
+                                                route_global_num = "N/A"
+                                                temp_counter = 1
+                                                for temp_cluster_id, temp_cluster_info in sorted(warehouse_routes.items()):
+                                                    if temp_cluster_id == cluster_id:
+                                                        route_global_num = temp_counter + j - 1
+                                                        break
+                                                    temp_counter += len(temp_cluster_info['routes'])
+                                                
+                                                routes_data.append({
+                                                    'Global Route': f"Route {route_global_num}",
+                                                    'Local Route': f"Route {j}",
+                                                    'Orders': route['order_count'],
+                                                    'Driver': route['driver_id'],
+                                                    'Color': route_colors[(route_global_num - 1) % len(route_colors)] if isinstance(route_global_num, int) else '#000000'
+                                                })
+                                            
+                                            if routes_data:
+                                                routes_df = pd.DataFrame(routes_data)
+                                                st.dataframe(routes_df, hide_index=True)
+                                                
+                                                # Show cluster-specific insights
+                                                st.markdown(f"**Cluster {cluster_id} Insights:**")
+                                                col1, col2, col3 = st.columns(3)
+                                                with col1:
+                                                    st.metric("Total Orders", cluster_orders)
+                                                with col2:
+                                                    st.metric("Routes Needed", cluster_routes_count)
+                                                with col3:
+                                                    avg_orders_per_route = cluster_orders / cluster_routes_count if cluster_routes_count > 0 else 0
+                                                    st.metric("Avg Orders/Route", f"{avg_orders_per_route:.1f}")
+                                
+                                else:
+                                    st.info("No routes generated for this warehouse")
+                            else:
+                                st.info(f"👆 Click the button above to optimize routes for {warehouse}")
+                
+                else:
+                    st.error("❌ No clustered data available. Please create clusters first in the Map Analysis tab.")
         
         else:
-            st.info("👆 **Create clusters using the sidebar to see the comparison and driver analysis.**")
+            st.info("👆 **Create clusters using the sidebar to see the comparison visualization.**")
     
     else:
         st.info("👆 **Upload your delivery data above to begin analysis.**")
